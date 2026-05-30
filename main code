@@ -1,0 +1,621 @@
+from machine import Pin, SPI, ADC, PWM
+import time
+import math
+from ili9488 import ILI9488
+
+# =====================================================
+#   TFT INIT
+# =====================================================
+spi = SPI(
+    1,
+    baudrate=40_000_000,
+    polarity=0,
+    phase=0,
+    sck=Pin(12),
+    mosi=Pin(11),
+    miso=Pin(13)
+)
+
+tft = ILI9488(
+    spi=spi,
+    cs=Pin(10, Pin.OUT),
+    dc=Pin(9, Pin.OUT),
+    rst=Pin(14, Pin.OUT),
+    width=480,
+    height=320
+)
+
+try:
+    tft.write_cmd(0x36)
+    tft.write_data(bytearray([0x28]))
+except:
+    pass
+
+# =====================================================
+#   COLORS
+# =====================================================
+BLACK  = 0x0000
+WHITE  = 0xFFFF
+BLUE   = 0x001F
+CYAN   = 0x07FF
+RED    = 0xF800
+
+# =====================================================
+#   ENCODER
+# =====================================================
+ENC_CLK = 17
+ENC_DT  = 18
+ENC_SW  = 16
+
+clk = Pin(ENC_CLK, Pin.IN, Pin.PULL_UP)
+dt  = Pin(ENC_DT,  Pin.IN, Pin.PULL_UP)
+sw  = Pin(ENC_SW,  Pin.IN, Pin.PULL_UP)
+
+last_clk = clk.value()
+
+# =====================================================
+#   STEPPER DRIVER + PWM
+# =====================================================
+STEP_PIN = 40
+DIR_PIN  = 41
+EN_PIN   = 42
+
+DIR_STATE = 0
+
+DIR  = Pin(DIR_PIN,  Pin.OUT, value=DIR_STATE)
+EN   = Pin(EN_PIN,   Pin.OUT, value=1)   # 1 = כבוי, 0 = דולק
+
+pwm_step = PWM(Pin(STEP_PIN))
+pwm_step.duty_u16(0)   # בלי צעדים בהתחלה
+prev_motor_speed = 0
+
+# =====================================================
+#   HEATER + TEMP SENSOR
+# =====================================================
+HEATER_PIN = 4
+HEATER = Pin(HEATER_PIN, Pin.OUT, value=0)
+
+TEMP_ADC_PIN = 1
+temp_pin = Pin(TEMP_ADC_PIN, Pin.IN)
+adc = ADC(temp_pin)
+
+current_temp   = 25
+heater_enabled = False
+heater_output  = 0
+
+TEMP_INTERVAL = 500   # ms
+HEAT_INTERVAL = 500
+TEMP_HYST     = 2
+
+last_temp_ms = time.ticks_ms()
+last_heat_ms = time.ticks_ms()
+
+# ===== כיול טמפרטורה =====
+T_ROOM = 25.0
+K_SCALE = 100.0 / 130.0  # אם צריך עוד דיוק – נשחק בזה
+
+def read_temp():
+    """
+    קריאת NTC 100k עם נגד 100k וטמפ' מתוקננת.
+    """
+    global current_temp
+
+    samples = 0
+    N = 8
+    for _ in range(N):
+        samples += adc.read()
+    raw = samples // N
+
+    if raw <= 0 or raw >= 4094:
+        return current_temp
+
+    R_SERIES = 100000.0
+    v_ratio = raw / 4095.0
+    if v_ratio <= 0.0 or v_ratio >= 1.0:
+        return current_temp
+
+    R_ntc = R_SERIES * v_ratio / (1.0 - v_ratio)
+
+    R0 = 100000.0
+    T0 = 25.0 + 273.15
+    B  = 3950.0
+
+    if R_ntc <= 0:
+        return current_temp
+
+    invT = (1.0 / T0) + (1.0 / B) * math.log(R_ntc / R0)
+    T = 1.0 / invT
+    temp_c = T - 273.15
+
+    # כיול – דחיסת סקאלה
+    temp_c = T_ROOM + (temp_c - T_ROOM) * K_SCALE
+
+    if temp_c < 0:
+        temp_c = 0
+    if temp_c > 300:
+        temp_c = 300
+
+    return int(temp_c)
+
+# =====================================================
+#   STATES
+# =====================================================
+STATE_MENU  = 0
+STATE_SPEED = 1
+STATE_TEMP  = 2
+
+state = STATE_MENU
+menu_index = 0
+last_menu_index = None
+
+# המנוע מתחיל על 0% – כבוי עד שתעלה
+speed_value = 0
+temp_value  = 150
+motor_speed = 0
+
+STEP_SPEED = 5
+STEP_TEMP  = 5
+
+last_ramp_ms = time.ticks_ms()
+
+# =====================================================
+#   FONT (5×7) – כולל F ו-K
+# =====================================================
+FONT = {
+    'A':[0b01110,0b10001,0b10001,0b11111,0b10001,0b10001,0b10001],
+    'C':[0b01110,0b10001,0b10000,0b10000,0b10000,0b10001,0b01110],
+    'D':[0b11110,0b10001,0b10001,0b10001,0b10001,0b10001,0b11110],
+    'E':[0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b11111],
+    'F':[0b11111,0b10000,0b10000,0b11110,0b10000,0b10000,0b10000],
+    'I':[0b01110,0b00100,0b00100,0b00100,0b00100,0b00100,0b01110],
+    'K':[0b10001,0b10010,0b10100,0b11000,0b10100,0b10010,0b10001],
+    'L':[0b10000,0b10000,0b10000,0b10000,0b10000,0b10000,0b11111],
+    'M':[0b10001,0b11011,0b10101,0b10101,0b10001,0b10001,0b10001],
+    'N':[0b10001,0b11001,0b10101,0b10011,0b10001,0b10001,0b10001],
+    'O':[0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110],
+    'P':[0b11110,0b10001,0b10001,0b11110,0b10000,0b10000,0b10000],
+    'R':[0b11110,0b10001,0b10001,0b11110,0b10100,0b10010,0b10001],
+    'S':[0b01111,0b10000,0b10000,0b01110,0b00001,0b00001,0b11110],
+    'T':[0b11111,0b00100,0b00100,0b00100,0b00100,0b00100,0b00100],
+    'U':[0b10001,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110],
+    '0':[0b01110,0b10001,0b10001,0b10001,0b10001,0b10001,0b01110],
+    '1':[0b00100,0b01100,0b00100,0b00100,0b00100,0b00100,0b01110],
+    '2':[0b01110,0b10001,0b00001,0b00010,0b00100,0b01000,0b11111],
+    '3':[0b01110,0b10001,0b00001,0b00110,0b00001,0b10001,0b01110],
+    '4':[0b00010,0b00110,0b01010,0b10010,0b11111,0b00010,0b00010],
+    '5':[0b11111,0b10000,0b11110,0b00001,0b00001,0b10001,0b01110],
+    '6':[0b01110,0b10000,0b11110,0b10001,0b10001,0b10001,0b01110],
+    '7':[0b11111,0b00001,0b00010,0b00100,0b01000,0b01000,0b01000],
+    '8':[0b01110,0b10001,0b10001,0b01110,0b10001,0b10001,0b01110],
+    '9':[0b01110,0b10001,0b10001,0b01111,0b00001,0b00001,0b01110],
+}
+
+PIX = 2  # סקייל ברירת מחדל ל-UI
+
+def draw_char(ch,x,y,color):
+    ch = ch.upper()
+    if ch not in FONT:
+        return
+    rows = FONT[ch]
+    for r in range(7):
+        bits = rows[r]
+        for c in range(5):
+            if (bits >> (4 - c)) & 1:
+                tft.fill_rect(x + c*PIX, y + r*PIX, PIX, PIX, color)
+
+def draw_text(text,x,y,color):
+    for ch in text:
+        if ch == " ":
+            x += 12
+        else:
+            draw_char(ch,x,y,color)
+            x += 12
+
+# ========= פונקציות לטקסט גדול (רק לספלש) =========
+def draw_char_scaled(ch, x, y, color, scale):
+    ch = ch.upper()
+    if ch not in FONT:
+        return
+    rows = FONT[ch]
+    for r in range(7):
+        bits = rows[r]
+        for c in range(5):
+            if (bits >> (4 - c)) & 1:
+                tft.fill_rect(x + c*scale, y + r*scale, scale, scale, color)
+
+def draw_text_scaled(text, x, y, color, scale):
+    for ch in text:
+        if ch == " ":
+            x += (5 + 2) * scale
+        else:
+            draw_char_scaled(ch, x, y, color, scale)
+            x += (5 + 2) * scale
+
+# =====================================================
+#   FRAME
+# =====================================================
+def frame(x,y,w,h):
+    tft.fill_rect(x,y,w,2,WHITE)
+    tft.fill_rect(x,y+h-2,w,2,WHITE)
+    tft.fill_rect(x,y,2,h,WHITE)
+    tft.fill_rect(x+w-2,y,2,h,WHITE)
+
+# =====================================================
+#   HEAT / COOL ICONS (בעמוד טמפרטורה)
+# =====================================================
+ICON_X = 320
+ICON_Y = 180
+ICON_W = 80
+ICON_H = 60
+
+last_icon_state = None  # "OFF" / "HEAT" / "COOL"
+
+def draw_heating_icon():
+    # clear area
+    tft.fill_rect(ICON_X, ICON_Y, ICON_W, ICON_H, BLACK)
+    # three "heat waves"
+    for i in range(3):
+        base_x = ICON_X + 10 + i*15
+        for j in range(6):
+            dx = j % 2
+            tft.fill_rect(base_x+dx, ICON_Y+5+j*6, 3, 5, RED)
+
+def draw_cooling_icon():
+    tft.fill_rect(ICON_X, ICON_Y, ICON_W, ICON_H, BLACK)
+    # small ice cube
+    x = ICON_X + 20
+    y = ICON_Y + 10
+    size = 30
+    # border
+    tft.fill_rect(x, y, size, 2, WHITE)
+    tft.fill_rect(x, y+size-2, size, 2, WHITE)
+    tft.fill_rect(x, y, 2, size, WHITE)
+    tft.fill_rect(x+size-2, y, 2, size, WHITE)
+    # inside
+    tft.fill_rect(x+3, y+3, size-6, size-6, BLUE)
+    # cross
+    tft.fill_rect(x+size//2-1, y+5, 2, size-10, WHITE)
+    tft.fill_rect(x+5, y+size//2-1, size-10, 2, WHITE)
+
+def clear_icon():
+    tft.fill_rect(ICON_X, ICON_Y, ICON_W, ICON_H, BLACK)
+
+def update_heat_icon():
+    global last_icon_state
+    if not heater_enabled:
+        icon_state = "OFF"
+    else:
+        if heater_output:
+            icon_state = "HEAT"
+        else:
+            icon_state = "COOL"
+
+    if icon_state == last_icon_state:
+        return
+
+    if icon_state == "OFF":
+        clear_icon()
+    elif icon_state == "HEAT":
+        draw_heating_icon()
+    else:
+        draw_cooling_icon()
+
+    last_icon_state = icon_state
+
+# =====================================================
+#   MAIN MENU + טמפרטורה במסך הבית
+# =====================================================
+item_x = 20
+item_w = 440
+item_h = 60
+item0_y = 80
+item1_y = 160
+
+last_home_temp = None
+
+def update_home_temp(force=False):
+    """
+    במסך הבית – רק המספר מתעדכן, לא כל השורה.
+    TEMP: ... C נצייר פעם אחת, ואח"כ רק המספר.
+    """
+    global last_home_temp
+
+    if state != STATE_MENU:
+        return
+    if (not force) and (last_home_temp == current_temp):
+        return
+
+    # מעדכן רק את המספר (אזור קטן)
+    tft.fill_rect(320, 55, 60, 25, BLACK)
+    draw_text(str(current_temp), 320, 55, WHITE)
+
+    last_home_temp = current_temp
+
+def draw_menu():
+    global last_menu_index, last_home_temp, state
+
+    state = STATE_MENU
+    tft.fill(BLACK)
+
+    tft.fill_rect(0,0,480,50,CYAN)
+    frame(0,0,480,50)
+    draw_text("MAIN MENU", 20, 14, BLACK)
+
+    # שורת TEMP קבועה – טקסט פעם אחת
+    draw_text("TEMP:", 240, 55, WHITE)
+    draw_text("C",     400, 55, WHITE)
+
+    tft.fill_rect(item_x,item0_y,item_w,item_h,BLUE)
+    draw_text("MOTOR SPEED", item_x+30, item0_y+18, WHITE)
+
+    tft.fill_rect(item_x,item1_y,item_w,item_h,BLUE)
+    draw_text("TEMPERATURE", item_x+30, item1_y+18, WHITE)
+
+    last_menu_index = None
+    last_home_temp = None
+    update_home_temp(True)
+
+def highlight_menu(i):
+    global last_menu_index
+
+    if i == last_menu_index:
+        return
+
+    tft.fill_rect(item_x,item0_y,item_w,item_h,BLUE)
+    draw_text("MOTOR SPEED", item_x+30, item0_y+18, WHITE)
+
+    tft.fill_rect(item_x,item1_y,item_w,item_h,BLUE)
+    draw_text("TEMPERATURE", item_x+30, item1_y+18, WHITE)
+
+    if i == 0:
+        frame(item_x,item0_y,item_w,item_h)
+    else:
+        frame(item_x,item1_y,item_w,item_h)
+
+    last_menu_index = i
+
+# =====================================================
+#   SPEED SCREEN
+# =====================================================
+def draw_speed_screen():
+    global state
+    state = STATE_SPEED
+
+    tft.fill(BLACK)
+    tft.fill_rect(0,0,480,40,BLUE)
+    frame(0,0,480,40)
+    draw_text("MOTOR SPEED",10,8,WHITE)
+
+    draw_text("SPEED",40,80,WHITE)
+    draw_text("PCT",300,80,WHITE)
+    draw_text("DIR:",40,130,WHITE)
+    draw_text("BTN:DIR  HOLD:MENU",40,200,WHITE)
+
+    update_speed()
+
+def update_speed():
+    tft.fill_rect(180,80,150,30,BLACK)
+    draw_text(str(speed_value),180,80,WHITE)
+
+    d = "FWD" if DIR_STATE == 0 else "REV"
+    tft.fill_rect(120,130,150,30,BLACK)
+    draw_text(d,120,130,WHITE)
+
+def enter_speed():
+    draw_speed_screen()
+
+# =====================================================
+#   TEMP SCREEN
+# =====================================================
+last_set  = None
+last_cur  = None
+last_heat = None
+
+def draw_temp_screen():
+    global state, last_set, last_cur, last_heat, last_icon_state
+    state = STATE_TEMP
+
+    tft.fill(BLACK)
+
+    tft.fill_rect(0,0,480,40,BLUE)
+    frame(0,0,480,40)
+    draw_text("TEMPERATURE",10,8,WHITE)
+
+    draw_text("SET:",  40, 80, WHITE)
+    draw_text("CUR:",  40,140, WHITE)
+    draw_text("HEAT:", 40,200, WHITE)
+    draw_text("BTN:TOGGLE  HOLD:MENU",40,260,WHITE)
+
+    last_set  = None
+    last_cur  = None
+    last_heat = None
+    last_icon_state = None
+
+    update_temp_screen(True)
+
+def update_temp_screen(force=False):
+    global last_set, last_cur, last_heat
+
+    if force or last_set != temp_value:
+        tft.fill_rect(140,80,200,30,BLACK)
+        draw_text(str(temp_value),140,80,WHITE)
+        draw_text("C",260,80,WHITE)
+        last_set = temp_value
+
+    if force or last_cur != current_temp:
+        tft.fill_rect(140,140,200,30,BLACK)
+        draw_text(str(current_temp),140,140,WHITE)
+        draw_text("C",260,140,WHITE)
+        last_cur = current_temp
+
+    hs = "ON" if heater_enabled else "OFF"
+    if force or hs != last_heat:
+        tft.fill_rect(140,200,200,30,BLACK)
+        draw_text(hs,140,200,WHITE)
+        last_heat = hs
+
+    # לעדכן אייקון חימום/קירור
+    update_heat_icon()
+
+def enter_temp():
+    draw_temp_screen()
+
+# =====================================================
+#   SPLASH SCREEN – FILAMAKER גדול ובאמצע
+# =====================================================
+def splash_screen():
+    tft.fill(BLACK)
+    text = "FILAMAKER"
+    scale = 4  # כמה גדול
+    char_w = 5
+    spacing = 2
+    text_width = len(text) * (char_w + spacing) * scale
+    text_height = 7 * scale
+
+    x = (480 - text_width) // 2
+    y = (320 - text_height) // 2
+
+    draw_text_scaled(text, x, y, BLUE, scale)
+    time.sleep_ms(1500)
+
+# =====================================================
+#   BUTTON STATE (לא חוסם)
+# =====================================================
+btn_prev = 1
+btn_down_time = None
+
+# =====================================================
+#   STARTUP
+# =====================================================
+splash_screen()
+draw_menu()
+highlight_menu(menu_index)
+
+# =====================================================
+#   MAIN LOOP
+# =====================================================
+while True:
+
+    now = time.ticks_ms()
+
+    # -------- ENCODER ROTATION --------
+    c = clk.value()
+    if last_clk == 1 and c == 0:
+        direction = 1 if dt.value() else -1
+
+        if state == STATE_MENU:
+            menu_index += direction
+            if menu_index < 0:
+                menu_index = 0
+            if menu_index > 1:
+                menu_index = 1
+            highlight_menu(menu_index)
+
+        elif state == STATE_SPEED:
+            speed_value += direction * STEP_SPEED
+            if speed_value < 0:
+                speed_value = 0
+            if speed_value > 100:
+                speed_value = 100
+            update_speed()
+
+        elif state == STATE_TEMP:
+            temp_value += direction * STEP_TEMP
+            if temp_value < 0:
+                temp_value = 0
+            if temp_value > 300:
+                temp_value = 300
+            update_temp_screen()
+
+    last_clk = c
+
+    # -------- BUTTON (ללא while) --------
+    sw_val = sw.value()
+    if sw_val == 0 and btn_prev == 1:
+        btn_down_time = now
+
+    if sw_val == 1 and btn_prev == 0 and btn_down_time is not None:
+        press_ms = time.ticks_diff(now, btn_down_time)
+
+        if state == STATE_MENU:
+            if menu_index == 0:
+                enter_speed()
+            else:
+                enter_temp()
+
+        elif state == STATE_SPEED:
+            if press_ms < 600:
+                # שינוי כיוון
+                DIR_STATE = 1 - DIR_STATE
+                DIR.value(DIR_STATE)
+                update_speed()
+            else:
+                # חזרה לתפריט
+                state = STATE_MENU
+                draw_menu()
+                highlight_menu(menu_index)
+
+        elif state == STATE_TEMP:
+            if press_ms < 600:
+                # הדלקה/כיבוי חימום
+                heater_enabled = not heater_enabled
+                update_temp_screen()
+            else:
+                # חזרה לתפריט
+                state = STATE_MENU
+                draw_menu()
+                highlight_menu(menu_index)
+
+        btn_down_time = None
+
+    btn_prev = sw_val
+
+    # -------- TEMP READ --------
+    if time.ticks_diff(now,last_temp_ms) >= TEMP_INTERVAL:
+        last_temp_ms = now
+        current_temp = read_temp()
+        if state == STATE_TEMP:
+            update_temp_screen()
+        # עדכון טמפ' במסך הבית (רק המספר)
+        update_home_temp()
+
+    # -------- HEATER CONTROL --------
+    if time.ticks_diff(now,last_heat_ms) >= HEAT_INTERVAL:
+        last_heat_ms = now
+
+        if heater_enabled:
+            if current_temp < temp_value - TEMP_HYST:
+                heater_output = 1
+            elif current_temp > temp_value + TEMP_HYST:
+                heater_output = 0
+        else:
+            heater_output = 0
+
+        HEATER.value(heater_output)
+
+    # -------- MOTOR RAMP --------
+    if time.ticks_diff(now,last_ramp_ms) >= 10:
+        if motor_speed < speed_value:
+            motor_speed += 1
+        elif motor_speed > speed_value:
+            motor_speed -= 1
+        last_ramp_ms = now
+
+    # -------- STEPPER CONTROL דרך PWM --------
+    if motor_speed > 0:
+        EN.value(0)
+        if motor_speed != prev_motor_speed:
+            ratio = motor_speed / 100.0
+            freq = int(1000 + (6000 - 1000) * ratio)
+            if freq < 100:
+                freq = 100
+            pwm_step.freq(freq)
+            pwm_step.duty_u16(32768)
+            prev_motor_speed = motor_speed
+    else:
+        if prev_motor_speed != 0:
+            pwm_step.duty_u16(0)
+            EN.value(1)
+            prev_motor_speed = 0
+
+    time.sleep_us(50)
